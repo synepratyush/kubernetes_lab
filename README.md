@@ -7,7 +7,7 @@ guide_content = """
 # Building a Containerized Flask + MySQL Application for Kubernetes
 
 ## Overview
-You'll create a containerized application with:
+You'll create a containerized application with different NameSpace:
 - Flask web application (deployed as a Kubernetes Deployment)
 - MySQL database (deployed as a stateful service)
 - Both in separate namespaces on a public cloud Kubernetes cluster
@@ -16,7 +16,9 @@ You'll create a containerized application with:
 ## Step 1: Project Structure
 
 Create this directory structure:
-```
+## Project Structure
+
+```text
 flask-mysql-k8s/
 ├── app/
 │   ├── __init__.py
@@ -43,7 +45,8 @@ flask-mysql-k8s/
 
 ### app/__init__.py
 ```python
-from flask import Flask
+import os
+from flask import Flask, jsonify  # Added jsonify to handle JSON responses safely
 import mysql.connector
 from mysql.connector import Error
 
@@ -51,10 +54,10 @@ app = Flask(__name__)
 
 def get_db_connection():
     return mysql.connector.connect(
-        host='mysql-service',
-        database='flask_db',
-        user='flask_user',
-        password='flask_password'
+        host=os.environ.get('DB_HOST', 'mysql-service.mysql-db.svc.cluster.local'),
+        database=os.environ.get('DB_NAME', 'flask_db'),
+        user=os.environ.get('DB_USER', 'flask_user'),
+        password=os.environ.get('DB_PASSWORD', 'flask_password')
     )
 
 @app.route('/')
@@ -70,12 +73,37 @@ def home():
     except Error as e:
         return f'Database connection error: {str(e)}'
 
+# --- NEW SELECT QUERY ROUTE ---
+@app.route('/users')
+def get_users():
+    try:
+        connection = get_db_connection()
+        # dictionary=True converts rows into key-value pairs automatically
+        cursor = connection.cursor(dictionary=True) 
+        
+        # Execute the SELECT query
+        query = "SELECT id, username, email FROM users"
+        cursor.execute(query)
+        
+        # Fetch all matching rows
+        users = cursor.fetchall()
+        
+        cursor.close()
+        connection.close()
+        
+        # Return results structured as clean JSON
+        return jsonify(users)
+        
+    except Error as e:
+        return jsonify({"error": f"Failed to fetch data: {str(e)}"}), 500
+
 @app.route('/health')
 def health():
     return 'OK'
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
+
 ```
 
 ### app/requirements.txt
@@ -98,7 +126,8 @@ COPY . .
 
 EXPOSE 5000
 
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "4", "__init__.py:app"]
+CMD ["python", "-m", "gunicorn", "--bind", "0.0.0.0:5000", "--workers", "4", "main:app"]
+
 ```
 
 ## Step 3: MySQL Database Setup
@@ -160,8 +189,9 @@ metadata:
   namespace: flask-app
 data:
   FLASK_ENV: "production"
-  DB_HOST: "mysql-service.mysql-db"
+  DB_HOST: "mysql-service.mysql-db.svc.cluster.local"
   DB_NAME: "flask_db"
+  DB_PORT: "3306"
   APP_PORT: "5000"
 ```
 
@@ -190,6 +220,7 @@ data:
   MYSQL_USER: "flask_user"
   MYSQL_PASSWORD: "flask_password"
   MYSQL_DATABASE: "flask_db"
+  MYSQL_ROOT_PASSWORD: "flask_root_password"
 ```
 
 ## Step 6: Flask Deployment and Service
@@ -233,6 +264,7 @@ spec:
 
 ### k8s/flask-service.yaml
 ```yaml
+#cloud execution 
 apiVersion: v1
 kind: Service
 metadata:
@@ -246,6 +278,24 @@ spec:
     port: 80
     targetPort: 5000
   type: LoadBalancer
+#Local execution 
+  apiVersion: v1
+kind: Service
+metadata:
+  name: flask-service
+  namespace: flask-app
+  labels:
+    app: flask
+spec:
+  type: ClusterIP
+  selector:
+    app: flask
+  ports:
+  - port: 5000
+    targetPort: 5000
+    protocol: TCP
+    name: http
+
 ```
 
 ## Step 7: MySQL StatefulSet and Service
