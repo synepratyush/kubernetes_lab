@@ -1,0 +1,126 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-cluster-scripts
+data:
+  # Runs on ALL nodes, but conditionally executes ONLY on the primary node (ordinal 0)
+  setup-primary-hba.sh: |
+    #!/bin/bash
+    set -e
+    ORDINAL=$(hostname | grep -oE '[0-9]+$')
+    if [ "$ORDINAL" -eq 0 ]; then
+      echo "Configuring HBA rules on primary node..."
+      echo "host replication postgres all trust" >> "$PGDATA/pg_hba.conf"
+      # No need to run pg_ctl reload here; this directory executes BEFORE the main process starts
+    else
+      echo "Skipping HBA configuration on replica node $ORDINAL"
+    fi
+
+  # Orchestrates cloning loops on replicas during booting
+  init-replica.sh: |
+    #!/bin/bash
+    set -e
+    
+    # Correctly parse the pod hostname string
+    if [[ $(hostname) =~ -([0-9]+)$ ]]; then
+        ORDINAL=${BASH_REMATCH[1]}
+    else
+        echo "Failed to parse ordinal from hostname"
+        exit 1
+    fi
+
+    if [ "$ORDINAL" -eq 0 ]; then
+      echo "Initializing Node 0 as Cluster Primary..."
+      exit 0
+    fi
+
+    echo "Initializing Node ${ORDINAL} as Data Replica..."
+    
+    until pg_isready -h postgres-0.postgres -p 5432 -U postgres; do
+      echo "Waiting for postgres-0 to accept active connections..."
+      sleep 3
+    done
+
+    if [ ! -s "$PGDATA/PG_VERSION" ]; then
+      echo "Directory empty. Starting streaming backup clone..."
+      rm -rf "${PGDATA:?}"/* "${PGDATA:?}"/.* 2>/dev/null || true
+      
+      # Added -R flag to auto-generate standby.signal for Postgres 16 replication
+      PGPASSWORD=postgres pg_basebackup -h postgres-0.postgres -D "$PGDATA" -U postgres -v -P -R -X stream
+      echo "Replication snapshot completed successfully."
+    fi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  ports:
+  - name: postgres
+    port: 5432
+  clusterIP: None
+  selector:
+    app: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  selector:
+    matchLabels:
+      app: postgres
+  serviceName: postgres
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      initContainers:
+      - name: sync-replica-volumes
+        image: postgres:16
+        command: [ /bin/bash, /cluster-scripts/init-replica.sh ]
+        env:
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        - name: scripts
+          mountPath: /cluster-scripts
+      containers:
+      - name: postgres
+        image: postgres:16
+        env:
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_PASSWORD
+          value: postgres
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - name: postgres
+          containerPort: 5432
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        # Mount the primary setup script to docker-entrypoint-initdb.d
+        - name: scripts
+          mountPath: /docker-entrypoint-initdb.d/setup-primary-hba.sh
+          subPath: setup-primary-hba.sh
+      volumes:
+      - name: scripts
+        configMap:
+          name: postgres-cluster-scripts
+          defaultMode: 0755
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ ReadWriteOnce ]
+      resources:
+        requests:
+          storage: 1Gi

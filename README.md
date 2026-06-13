@@ -20,485 +20,336 @@ Create this directory structure:
 
 ```text
 flask-mysql-k8s/
-├── app/
-│   ├── __init__.py
-│   ├── requirements.txt
-│   └── Dockerfile
-├── mysql/
-│   ├── init.sql
-│   └── Dockerfile
-├── k8s/
-│   ├── namespace-flask.yaml
-│   ├── namespace-mysql.yaml
-│   ├── flask-configmap.yaml
-│   ├── flask-secret.yaml
-│   ├── flask-deployment.yaml
-│   ├── flask-service.yaml
-│   ├── mysql-statefulset.yaml
-│   ├── mysql-service.yaml
-│   └── mysql-secret.yaml
-├── docker-compose.yml
+├── postgres-cluster.yaml
+├── app=cluster.py
 └── README.md
 ```
 
 ## Step 2: Flask Application Code
 
-### app/__init__.py
+### app=cluster.py
 ```python
-import os
-from flask import Flask, jsonify  # Added jsonify to handle JSON responses safely
-import mysql.connector
-from mysql.connector import Error
+import psycopg2
+from psycopg2.extras import DictCursor
+from flask import Flask, render_template_string, request, redirect, url_for
 
 app = Flask(__name__)
 
-def get_db_connection():
-    return mysql.connector.connect(
-        host=os.environ.get('DB_HOST', 'mysql-service.mysql-db.svc.cluster.local'),
-        database=os.environ.get('DB_NAME', 'flask_db'),
-        user=os.environ.get('DB_USER', 'flask_user'),
-        password=os.environ.get('DB_PASSWORD', 'flask_password')
+# Fixed local configurations
+DB_USER = "postgres"
+DB_PASSWORD = "postgres"
+DB_NAME = "postgres"
+
+# Maps the pod names to the local forwarded ports we opened in Step 1
+POD_PORT_MAP = {
+    "postgres-0": 5430,  # Primary (Read/Write)
+    "postgres-1": 5431,  # Replica 1 (Read Only)
+    "postgres-2": 5432   # Replica 2 (Read Only)
+}
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Local K8s Postgres Controller</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #f4f6f9; color: #333; }
+        .container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1, h2 { color: #2c3e50; }
+        .alert { padding: 10px; background: #e2f0d9; border-left: 5px solid #70ad47; margin-bottom: 20px; }
+        .error { padding: 10px; background: #fce4d6; border-left: 5px solid #c65911; margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input[type="text"], input[type="email"], select { width: 100%; padding: 8px; box-sizing: border-box; }
+        button { background: #2980b9; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #3498db; }
+        .pod-badge { background: #8e44ad; color: white; padding: 3px 8px; border-radius: 4px; font-size: 12px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>PostgreSQL Cluster Viewer (Running Locally)</h1>
+    
+    <!-- Target Pod Selector -->
+    <form method="GET" action="/">
+        <div class="form-group">
+            <label for="target_pod">Choose Target Pod (Routes to unique local port):</label>
+            <select name="target_pod" id="target_pod" onchange="this.form.submit()">
+                <option value="postgres-0" {% if selected_pod == 'postgres-0' %}selected{% endif %}>postgres-0 (via Local Port 5430 - Primary)</option>
+                <option value="postgres-1" {% if selected_pod == 'postgres-1' %}selected{% endif %}>postgres-1 (via Local Port 5431 - Replica)</option>
+                <option value="postgres-2" {% if selected_pod == 'postgres-2' %}selected{% endif %}>postgres-2 (via Local Port 5432 - Replica)</option>
+            </select>
+        </div>
+    </form>
+
+    {% if msg %}<div class="alert">{{ msg }}</div>{% endif %}
+    {% if err %}<div class="error">{{ err }}</div>{% endif %}
+
+    <!-- Data Modification Form -->
+    <h2>Add New User</h2>
+    <form method="POST" action="/add?target_pod={{ selected_pod }}">
+        <div class="form-group">
+            <label>Name:</label>
+            <input type="text" name="name" required placeholder="Bob Tester">
+        </div>
+        <div class="form-group">
+            <label>Email:</label>
+            <input type="email" name="email" required placeholder="bob@tester.com">
+        </div>
+        <button type="submit">Insert User Row</button>
+    </form>
+
+    <!-- Data View Table -->
+    <h2>Current Rows on <span class="pod-badge">{{ selected_pod }}</span></h2>
+    <table>
+        <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Email</th>
+            <th>Created At</th>
+        </tr>
+        {% for user in users %}
+        <tr>
+            <td>{{ user.id }}</td>
+            <td>{{ user.name }}</td>
+            <td>{{ user.email }}</td>
+            <td>{{ user.created_at }}</td>
+        </tr>
+        {% else %}
+        <tr>
+            <td colspan="4" style="text-align: center;">No data found. Is port-forwarding running?</td>
+        </tr>
+        {% endfor %}
+    </table>
+</div>
+</body>
+</html>
+"""
+
+def get_db_connection(pod_name):
+    # Connects to localhost but targets the specific forwarded port for that pod
+    target_port = POD_PORT_MAP.get(pod_name, 5430)
+    return psycopg2.connect(
+        host="127.0.0.1",
+        port=target_port,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        connect_timeout=3
     )
 
-@app.route('/')
-def home():
+@app.route("/", methods=["GET"])
+def index():
+    selected_pod = request.args.get("target_pod", "postgres-0")
+    users = []
+    err = None
+    msg = request.args.get("msg")
+
     try:
-        connection = get_db_connection()
-        cursor = connection.cursor()
-        cursor.execute("SELECT VERSION()")
-        result = cursor.fetchone()
-        cursor.close()
-        connection.close()
-        return f'Connected to MySQL! Database version: {result}'
-    except Error as e:
-        return f'Database connection error: {str(e)}'
+        conn = get_db_connection(selected_pod)
+        cur = conn.cursor(cursor_factory=DictCursor)
+        cur.execute("SELECT id, name, email, created_at FROM users ORDER BY id DESC;")
+        users = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        err = f"Failed connecting locally to {selected_pod} on port {POD_PORT_MAP.get(selected_pod)}: {str(e)}"
 
-# --- NEW SELECT QUERY ROUTE ---
-@app.route('/users')
-def get_users():
+    return render_template_string(HTML_TEMPLATE, users=users, selected_pod=selected_pod, err=err, msg=msg)
+
+@app.route("/add", methods=["POST"])
+def add_user():
+    target_pod = request.args.get("target_pod", "postgres-0")
+    name = request.form.get("name")
+    email = request.form.get("email")
+    
     try:
-        connection = get_db_connection()
-        # dictionary=True converts rows into key-value pairs automatically
-        cursor = connection.cursor(dictionary=True) 
-        
-        # Execute the SELECT query
-        query = "SELECT id, username, email FROM users"
-        cursor.execute(query)
-        
-        # Fetch all matching rows
-        users = cursor.fetchall()
-        
-        cursor.close()
-        connection.close()
-        
-        # Return results structured as clean JSON
-        return jsonify(users)
-        
-    except Error as e:
-        return jsonify({"error": f"Failed to fetch data: {str(e)}"}), 500
+        conn = get_db_connection(target_pod)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO users (name, email) VALUES (%s, %s);", (name, email))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return redirect(url_for('index', target_pod=target_pod, msg="User successfully inserted!"))
+    except Exception as e:
+        err_msg = f"Write rejected by engine: {str(e)}"
+        return redirect(url_for('index', target_pod=target_pod, err=err_msg))
 
-@app.route('/health')
-def health():
-    return 'OK'
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    # Launch local development server
+    app.run(host="127.0.0.1", port=9090, debug=True)
 
 ```
-
-### app/requirements.txt
-```
-Flask==3.0.0
-mysql-connector-python==8.2.0
-gunicorn==21.2.0
-```
-
-### app/Dockerfile
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-EXPOSE 5000
-
-CMD ["python", "-m", "gunicorn", "--bind", "0.0.0.0:5000", "--workers", "4", "main:app"]
-
-```
-
-## Step 3: MySQL Database Setup
-
-### mysql/init.sql
-```sql
-CREATE DATABASE IF NOT EXISTS flask_db;
-USE flask_db;
-
-CREATE TABLE IF NOT EXISTS users (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    username VARCHAR(50) NOT NULL,
-    email VARCHAR(100) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-INSERT INTO users (username, email) VALUES ('test_user', 'test@example.com');
-```
-
-### mysql/Dockerfile
-```dockerfile
-FROM mysql:8.0
-
-COPY init.sql /docker-entrypoint-initdb.d/
-
-EXPOSE 3306
-```
-
-## Step 4: Kubernetes Namespace Configurations
-
-### k8s/namespace-flask.yaml
-```yaml
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: flask-app
-  labels:
-    app: flask
-```
-
-### k8s/namespace-mysql.yaml
-```yaml
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: mysql-db
-  labels:
-    app: mysql
-```
-
-## Step 5: ConfigMaps and Secrets
-
-### k8s/flask-configmap.yaml
+### postgres-cluster.yaml
 ```yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: flask-config
-  namespace: flask-app
+  name: postgres-cluster-scripts
 data:
-  FLASK_ENV: "production"
-  DB_HOST: "mysql-service.mysql-db.svc.cluster.local"
-  DB_NAME: "flask_db"
-  DB_PORT: "3306"
-  APP_PORT: "5000"
-```
+  # Runs on ALL nodes, but conditionally executes ONLY on the primary node (ordinal 0)
+  setup-primary-hba.sh: |
+    #!/bin/bash
+    set -e
+    ORDINAL=$(hostname | grep -oE '[0-9]+$')
+    if [ "$ORDINAL" -eq 0 ]; then
+      echo "Configuring HBA rules on primary node..."
+      echo "host replication postgres all trust" >> "$PGDATA/pg_hba.conf"
+      # No need to run pg_ctl reload here; this directory executes BEFORE the main process starts
+    else
+      echo "Skipping HBA configuration on replica node $ORDINAL"
+    fi
 
-### k8s/flask-secret.yaml
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: flask-secret
-  namespace: flask-app
-type: Opaque
-data:
-  DB_USER: "flask_user"
-  DB_PASSWORD: "flask_password"
-```
+  # Orchestrates cloning loops on replicas during booting
+  init-replica.sh: |
+    #!/bin/bash
+    set -e
+    
+    # Correctly parse the pod hostname string
+    if [[ $(hostname) =~ -([0-9]+)$ ]]; then
+        ORDINAL=${BASH_REMATCH[1]}
+    else
+        echo "Failed to parse ordinal from hostname"
+        exit 1
+    fi
 
-### k8s/mysql-secret.yaml
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: mysql-secret
-  namespace: mysql-db
-type: Opaque
-data:
-  MYSQL_USER: "flask_user"
-  MYSQL_PASSWORD: "flask_password"
-  MYSQL_DATABASE: "flask_db"
-  MYSQL_ROOT_PASSWORD: "flask_root_password"
-```
+    if [ "$ORDINAL" -eq 0 ]; then
+      echo "Initializing Node 0 as Cluster Primary..."
+      exit 0
+    fi
 
-## Step 6: Flask Deployment and Service
+    echo "Initializing Node ${ORDINAL} as Data Replica..."
+    
+    until pg_isready -h postgres-0.postgres -p 5432 -U postgres; do
+      echo "Waiting for postgres-0 to accept active connections..."
+      sleep 3
+    done
 
-### k8s/flask-deployment.yaml
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: flask-app
-  namespace: flask-app
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: flask
-  template:
-    metadata:
-      labels:
-        app: flask
-    spec:
-      containers:
-      - name: flask-container
-        image: your-registry/flask-app:latest
-        imagePullPolicy: Always
-        ports:
-        - containerPort: 5000
-        envFrom:
-        - configMapRef:
-            name: flask-config
-        - secretRef:
-            name: flask-secret
-        resources:
-          requests:
-            memory: "128Mi"
-            cpu: "100m"
-          limits:
-            memory: "256Mi"
-            cpu: "200m"
-```
-
-### k8s/flask-service.yaml
-```yaml
-#cloud execution 
+    if [ ! -s "$PGDATA/PG_VERSION" ]; then
+      echo "Directory empty. Starting streaming backup clone..."
+      rm -rf "${PGDATA:?}"/* "${PGDATA:?}"/.* 2>/dev/null || true
+      
+      # Added -R flag to auto-generate standby.signal for Postgres 16 replication
+      PGPASSWORD=postgres pg_basebackup -h postgres-0.postgres -D "$PGDATA" -U postgres -v -P -R -X stream
+      echo "Replication snapshot completed successfully."
+    fi
+---
 apiVersion: v1
 kind: Service
 metadata:
-  name: flask-service
-  namespace: flask-app
-spec:
-  selector:
-    app: flask
-  ports:
-  - protocol: TCP
-    port: 80
-    targetPort: 5000
-  type: LoadBalancer
-#Local execution 
-  apiVersion: v1
-kind: Service
-metadata:
-  name: flask-service
-  namespace: flask-app
+  name: postgres
   labels:
-    app: flask
+    app: postgres
 spec:
-  type: ClusterIP
-  selector:
-    app: flask
   ports:
-  - port: 5000
-    targetPort: 5000
-    protocol: TCP
-    name: http
-
-```
-
-## Step 7: MySQL StatefulSet and Service
-
-### k8s/mysql-statefulset.yaml
-```yaml
+  - name: postgres
+    port: 5432
+  clusterIP: None
+  selector:
+    app: postgres
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: mysql
-  namespace: mysql-db
+  name: postgres
 spec:
-  serviceName: mysql-service
-  replicas: 1
   selector:
     matchLabels:
-      app: mysql
+      app: postgres
+  serviceName: postgres
+  replicas: 3
   template:
     metadata:
       labels:
-        app: mysql
+        app: postgres
     spec:
-      containers:
-      - name: mysql-container
-        image: your-registry/mysql:latest
-        imagePullPolicy: Always
-        ports:
-        - containerPort: 3306
-        envFrom:
-        - secretRef:
-            name: mysql-secret
+      initContainers:
+      - name: sync-replica-volumes
+        image: postgres:16
+        command: [ /bin/bash, /cluster-scripts/init-replica.sh ]
+        env:
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
         volumeMounts:
-        - name: mysql-data
-          mountPath: /var/lib/mysql
-        resources:
-          requests:
-            memory: "256Mi"
-            cpu: "200m"
-          limits:
-            memory: "512Mi"
-            cpu: "400m"
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        - name: scripts
+          mountPath: /cluster-scripts
+      containers:
+      - name: postgres
+        image: postgres:16
+        env:
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_PASSWORD
+          value: postgres
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - name: postgres
+          containerPort: 5432
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        # Mount the primary setup script to docker-entrypoint-initdb.d
+        - name: scripts
+          mountPath: /docker-entrypoint-initdb.d/setup-primary-hba.sh
+          subPath: setup-primary-hba.sh
+      volumes:
+      - name: scripts
+        configMap:
+          name: postgres-cluster-scripts
+          defaultMode: 0755
   volumeClaimTemplates:
   - metadata:
-      name: mysql-data
+      name: data
     spec:
-      accessModes: ["ReadWriteOnce"]
+      accessModes: [ ReadWriteOnce ]
       resources:
         requests:
-          storage: 10Gi
-      storageClassName: standard
+          storage: 1Gi
+
 ```
-
-### k8s/mysql-service.yaml
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: mysql-service
-  namespace: mysql-db
-spec:
-  ports:
-  - port: 3306
-    targetPort: 3306
-  selector:
-    app: mysql
-  type: ClusterIP
-```
-
-## Step 8: Docker Compose for Local Testing
-
-### docker-compose.yml
-```yaml
-version: '3.8'
-
-services:
-  flask:
-    build: ./app
-    ports:
-      - "5000:5000"
-    environment:
-      - DB_HOST=mysql
-      - DB_NAME=flask_db
-      - DB_USER=flask_user
-      - DB_PASSWORD=flask_password
-    depends_on:
-      - mysql
-
-  mysql:
-    build: ./mysql
-    ports:
-      - "3306:3306"
-    environment:
-      - MYSQL_USER=flask_user
-      - MYSQL_PASSWORD=flask_password
-      - MYSQL_DATABASE=flask_db
-```
-
-## Step 9: Deployment Commands
-
-### Create Namespaces
-```bash
-kubectl apply -f k8s/namespace-flask.yaml
-kubectl apply -f k8s/namespace-mysql.yaml
-```
-
-### Build and Push Docker Images
-```bash
-# Build Flask image
-docker build -t your-registry/flask-app:latest ./app
-
-# Build MySQL image
-docker build -t your-registry/mysql:latest ./mysql
-
-# Push to registry
-docker push your-registry/flask-app:latest
-docker push your-registry/mysql:latest
-```
-
 ### Deploy to Kubernetes
 ```bash
-# Apply ConfigMaps and Secrets
-kubectl apply -f k8s/flask-configmap.yaml
-kubectl apply -f k8s/flask-secret.yaml
-kubectl apply -f k8s/mysql-secret.yaml
+# Apply the updated production configurations
+kubectl apply -f postgres-cluster.yaml
 
-# Deploy Flask application
-kubectl apply -f k8s/flask-deployment.yaml
-kubectl apply -f k8s/flask-service.yaml
+#Run this command in your terminal to connect to the primary node (postgres-0) and create the table:
+kubectl exec -it postgres-0 -- psql -U postgres -c "
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);"
 
-# Deploy MySQL database
-kubectl apply -f k8s/mysql-statefulset.yaml
-kubectl apply -f k8s/mysql-service.yaml
+#Test the Live Replication AgainNow that the table structure exists across your cluster, you can verify that data streams instantly between your pods:Insert a row into the primary pod (postgres-0):
+kubectl exec -it postgres-0 -- psql -U postgres -c "INSERT INTO users (name, email) VALUES ('Bob Tester', 'bob@test.com');"
+
+Expected Output: INSERT 0 1
+
+#Read the row immediately from the replica pod (postgres-1):
+kubectl exec -it postgres-1 -- psql -U postgres -c "SELECT * FROM users;"
+
+Expected Visual Output from your Replica:
+ id |    name    |    email     |         created_at         
+----+------------+--------------+----------------------------
+  1 | Bob Tester | bob@test.com | 2026-06-12 14:43:25.123456
+(1 row)
 ```
 
-### Verify Deployment
+### How to Verify Your Data Replicates Live
 ```bash
-# Check Flask pods
-kubectl get pods -n flask-app
 
-# Check MySQL pods
-kubectl get pods -n mysql-db
+Insert into the primary node:
+kubectl exec -it postgres-0 -- psql -U postgres -c "INSERT INTO users (name, email) VALUES ('Bob Tester', 'bob@test.com');"
 
-# Get Flask service endpoint
-kubectl get service -n flask-app
-
-kubectl port-forward pod/mysql-0 -n mysql-db 3306:3306
-# try with workbench 
-
-# Test Flask application
-kubectl run test --rm --image=busybox --restart=Never --wget http://flask-service.flask-app.svc.cluster.local/
-```
-
-## Step 10: Public Cloud Specifics
-
-### Google Cloud Kubernetes (GKE)
-```bash
-# Create GKE cluster
-gcloud container clusters create flask-mysql-cluster \
-  --region=us-central1 \
-  --num-nodes=3
-
-# Get credentials
-gcloud container clusters get-credentials flask-mysql-cluster \
-  --region=us-central1
-```
-
-### AWS Elastic Kubernetes (EKS)
-```bash
-# Create EKS cluster
-eksctl create cluster --name flask-mysql-cluster \
-  --region=us-east-1 \
-  --nodes=3 \
-  --nodes-min=3 \
-  --nodes-max=5
-```
-
-### Azure Kubernetes (AKS)
-```bash
-# Create AKS cluster
-az aks create --resource-group myResourceGroup \
-  --name flask-mysql-cluster \
-  --node-count 3 \
-  --enable-addons monitoring
-```
-
-## Key Configuration Notes
-
-1. **Separate Namespaces**: Flask app in `flask-app`, MySQL in `mysql-db`
-2. **Stateful MySQL**: Uses StatefulSet with persistent volume claims (10Gi storage)
-3. **Configured Deployment**: Flask uses Deployment with 3 replicas
-4. **Secret Management**: Database credentials stored in Kubernetes Secrets
-5. **ConfigMap Usage**: Environment variables and configuration in ConfigMaps
-6. **Service Discovery**: MySQL accessible via `mysql-service.mysql-db` from Flask namespace
-7. **Resource Limits**: Both services have defined CPU/memory requests and limits
-8. **Public Cloud Ready**: Deployment commands compatible with GKE, EKS, AKS
-
-## Security Best Practices
-
-- Use Kubernetes Secrets for sensitive data (never hardcode passwords)
-- Implement network policies to restrict cross-namespace access
-- Use non-root containers in Docker images
-- Enable TLS for MySQL connections
-- Implement regular security updates for base images
+Read immediately from your replica node (postgres-1):
+kubectl exec -it postgres-1 -- psql -U postgres -c "SELECT * FROM users;" 
 
 This setup provides a production-ready containerized Flask + MySQL application deployed on Kubernetes with proper configuration management.
 """
