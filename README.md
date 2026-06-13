@@ -2,10 +2,11 @@
 # File: app-cluster.py
 # Project: Flask + Postgress Containerized Application for Kubernetes
 # This guide provides step-by-step instructions for building and deploying a containerized Flask app with Postgress database on Kubernetes
-#Your YAML manifest defines a high-availability, 3-replica PostgreSQL 16 cluster managed via a Kubernetes StatefulSet and a Headless Service.
-#Stateful Orchestration: The StatefulSet guarantees ordered pod creation (postgres-0 to postgres-2), persistent network identities, and dedicated storage volumes (1Gi each) via volumeClaimTemplates.
-#Headless Networking: Setting clusterIP: None allows pods to bypass standard load balancing and discover each other directly via internal DNS (e.g., postgres-0.postgres).
-#Cluster Initialization: An initContainer uses a custom script (init-replica.sh) to synchronize standby replicas with the primary instance, while the main container injects a network configuration script (setup-primary-hba.sh) into the PostgreSQL entry point.
+
+## Your YAML manifest defines a high-availability, 3-replica PostgreSQL 16 cluster managed via a Kubernetes StatefulSet and a Headless Service.
+## Stateful Orchestration: The StatefulSet guarantees ordered pod creation (postgres-0 to postgres-2), persistent network identities, and dedicated storage volumes (1Gi each) via volumeClaimTemplates.
+## Headless Networking: Setting clusterIP: None allows pods to bypass standard load balancing and discover each other directly via internal DNS (e.g., postgres-0.postgres).
+## Cluster Initialization: An initContainer uses a custom script (init-replica.sh) to synchronize standby replicas with the primary instance, while the main container injects a network configuration script (setup-primary-hba.sh) into the PostgreSQL entry point.
 
 guide_content = """
 # Building a local Flask web app + Postgress Application in Kubernetes
