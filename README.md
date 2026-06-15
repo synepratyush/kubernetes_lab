@@ -5,3 +5,12 @@ Automatic Write Routing: Unlike the previous version which would crash if you tr
 Role-Based Security Contexts: Differentiates database access by checking the targeted pod. It automatically applies Read-Only (DB_RO_USER) credentials to postgres-1 and postgres-2, and Read-Write (DB_RW_USER) credentials to postgres-0.
 Explicit Session Isolation: Re replicas (postgres-1/postgres-2), the script forcefully triggers conn.set_session(readonly=True, autocommit=True). This native block tells PostgreSQL to treat transactions as read-only, preventing sneaky data injection or split-brain states.
 Self-Healing Schema Check: Every time the main dashboard loads, the app connects to the primary node to run an silent CREATE TABLE IF NOT EXISTS users transaction, ensuring the schema exists before executing read operations.Safe Resource Management: Employs try...finally blocks to explicitly strip transactional flags (readonly=False) and return connection handlers to the global POOL_MAP via .putconn(conn) so the application never suffers from connection leaks.
+
+
+ docker build -t flask-pstg-app:latest ./app                                                                                         
+ docker tag flask-pstg-app:latest pratyusht/devops-flask-pstg-app:latest                                                             
+ docker push  pratyusht/devops-flask-pstg-app:latest 
+
+ kubectl apply -f .\k8s\.   
+
+ kubectl port-forward svc/flask-postgres-app 9090:80 
