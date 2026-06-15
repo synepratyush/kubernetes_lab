@@ -320,6 +320,8 @@ spec:
 ```
 ### Deploy to Kubernetes
 ```bash
+# docker build 
+docker build -t k8s-postgres-controller .
 # Apply the updated production configurations
 kubectl apply -f postgres-cluster.yaml
 

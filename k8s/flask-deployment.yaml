@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flask-postgres-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flask-postgres-app
+  template:
+    metadata:
+      labels:
+        app: flask-postgres-app
+    spec:
+      containers:
+      - name: flask-postgres-app
+        image: pratyusht/devops-flask-pstg-app:latest                    
+
+        imagePullPolicy: IfNotPresent
+
+        ports:
+        - containerPort: 9090
+
+        env:
+        - name: DB_USER
+          value: postgres
+
+        - name: DB_PASSWORD
+          value: postgres
+
+        - name: DB_NAME
+          value: postgres
